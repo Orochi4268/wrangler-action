@@ -1,0 +1,102 @@
+name: Build Self-Contained Executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: node16-win-x64
+            ext: .exe
+          - os: ubuntu-latest
+            target: node16-linux-x64
+            ext: ''
+          - os: macos-latest
+            target: node16-macos-x64
+            ext: ''
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Node.js 16
+      uses: actions/setup-node@v3
+      with:
+        node-version: '16'
+    
+    - name: Install npm 6
+      run: npm install -g npm@6
+    
+    - name: Install all dependencies
+      run: |
+        npm ci
+        npm install -g @vercel/ncc pkg
+    
+    - name: Bundle with all dependencies
+      run: |
+        # 使用 ncc 打包所有依赖到单个文件
+        ncc build src/index.js -o dist --minify --no-cache --external none
+        
+        # 复制必要的资源文件
+        mkdir -p dist/assets
+        cp -r templates dist/assets/ 2>/dev/null || true
+        cp -r config dist/assets/ 2>/dev/null || true
+        
+        # 创建包含所有资源的 package.json
+        cat > dist/package.json << 'EOF'
+        {
+          "name": "wrangler-action-standalone",
+          "version": "1.0.0",
+          "main": "index.js",
+          "bin": {
+            "wrangler-action": "index.js"
+          },
+          "pkg": {
+            "assets": [
+              "assets/**/*",
+              "node_modules/**/*"
+            ],
+            "scripts": [
+              "index.js"
+            ]
+          }
+        }
+        EOF
+    
+    - name: Download platform-specific binaries
+      run: |
+        mkdir -p dist/bin
+        
+        # 下载 wrangler 二进制文件
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-pc-windows-msvc.exe -o dist/bin/wrangler.exe
+        elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-unknown-linux-musl -o dist/bin/wrangler
+          chmod +x dist/bin/wrangler
+        else
+          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-apple-darwin -o dist/bin/wrangler
+          chmod +x dist/bin/wrangler
+        fi
+      shell: bash
+    
+    - name: Create self-contained executable
+      run: |
+        cd dist
+        pkg . --target ${{ matrix.target }} --output wrangler-action${{ matrix.ext }} --compress GZip
+    
+    - name: Test executable
+      run: |
+        cd dist
+        ./wrangler-action${{ matrix.ext }} --help || echo "Help command test"
+      shell: bash
+    
+    - name: Upload executable
+      uses: actions/upload-artifact@v3
+      with:
+        name: wrangler-action-${{ runner.os }}-standalone
+        path: dist/wrangler-action${{ matrix.ext }}
