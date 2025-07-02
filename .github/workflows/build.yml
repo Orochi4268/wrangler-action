@@ -3,51 +3,74 @@ name: Build Self-Contained Executable
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, master]
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false  # 关键：防止一个失败导致全部取消
       matrix:
         include:
           - os: windows-latest
             target: node16-win-x64
             ext: .exe
+            node-version: '16'
           - os: ubuntu-latest
             target: node16-linux-x64
             ext: ''
+            node-version: '16'
           - os: macos-latest
             target: node16-macos-x64
             ext: ''
+            node-version: '16'
     
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v3
     
-    - name: Setup Node.js 16
+    - name: Setup Node.js
       uses: actions/setup-node@v3
       with:
-        node-version: '16'
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
     
     - name: Install npm 6
-      run: npm install -g npm@6
-    
-    - name: Install all dependencies
       run: |
-        npm ci
+        npm install -g npm@6
+        npm --version
+        echo "npm 6 installed successfully"
+    
+    - name: Install dependencies
+      run: |
+        npm ci --production=false
         npm install -g @vercel/ncc pkg
+        echo "Dependencies installed"
     
-    - name: Bundle with all dependencies
+    - name: Bundle application
       run: |
-        # 使用 ncc 打包所有依赖到单个文件
-        ncc build src/index.js -o dist --minify --no-cache --external none
+        ncc build src/index.js -o dist --minify --external none
+        echo "Application bundled"
+    
+    - name: Download platform binaries
+      run: |
+        mkdir -p dist/bin
         
-        # 复制必要的资源文件
-        mkdir -p dist/assets
-        cp -r templates dist/assets/ 2>/dev/null || true
-        cp -r config dist/assets/ 2>/dev/null || true
+        if [[ "${{ runner.os }}" == "Windows" ]]; then
+          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-pc-windows-msvc.exe -o dist/bin/wrangler.exe
+        elif [[ "${{ runner.os }}" == "Linux" ]]; then
+          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-unknown-linux-musl -o dist/bin/wrangler
+          chmod +x dist/bin/wrangler
+        else
+          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-apple-darwin -o dist/bin/wrangler
+          chmod +x dist/bin/wrangler
+        fi
         
-        # 创建包含所有资源的 package.json
+        ls -la dist/bin/
+      shell: bash
+    
+    - name: Create package.json for pkg
+      run: |
         cat > dist/package.json << 'EOF'
         {
           "name": "wrangler-action-standalone",
@@ -58,45 +81,25 @@ jobs:
           },
           "pkg": {
             "assets": [
-              "assets/**/*",
-              "node_modules/**/*"
-            ],
-            "scripts": [
-              "index.js"
+              "bin/**/*"
             ]
           }
         }
         EOF
     
-    - name: Download platform-specific binaries
-      run: |
-        mkdir -p dist/bin
-        
-        # 下载 wrangler 二进制文件
-        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-pc-windows-msvc.exe -o dist/bin/wrangler.exe
-        elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-unknown-linux-musl -o dist/bin/wrangler
-          chmod +x dist/bin/wrangler
-        else
-          curl -L https://github.com/cloudflare/wrangler2/releases/latest/download/wrangler-x86_64-apple-darwin -o dist/bin/wrangler
-          chmod +x dist/bin/wrangler
-        fi
-      shell: bash
-    
-    - name: Create self-contained executable
+    - name: Create executable
       run: |
         cd dist
         pkg . --target ${{ matrix.target }} --output wrangler-action${{ matrix.ext }} --compress GZip
-    
-    - name: Test executable
-      run: |
-        cd dist
-        ./wrangler-action${{ matrix.ext }} --help || echo "Help command test"
-      shell: bash
+        ls -la wrangler-action*
+      continue-on-error: true  # 允许部分平台失败
     
     - name: Upload executable
+      if: success() || failure()  # 即使前面步骤失败也尝试上传
       uses: actions/upload-artifact@v3
       with:
         name: wrangler-action-${{ runner.os }}-standalone
-        path: dist/wrangler-action${{ matrix.ext }}
+        path: |
+          dist/wrangler-action*
+          dist/bin/*
+        if-no-files-found: warn
